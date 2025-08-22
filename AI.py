@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 
 import monai
 from monai.transforms import (
-    Compose,
+ Compose,
     LoadImaged,
     EnsureChannelFirstd,
     Orientationd,
@@ -27,6 +27,8 @@ from monai.transforms import (
     EnsureTyped,
     Activations,
     AsDiscrete,
+    Resized,
+    ScaleIntensityRanged,
 )
 from monai.data import CacheDataset, DataLoader, decollate_batch
 from monai.networks.nets import UNet
@@ -59,12 +61,10 @@ print("Using device:", device)
  #Prepping Dataset
 train_transforms = Compose([
     LoadImaged(keys=["image", "label"]),
-    EnsureChannelFirstd(keys=["image", "label"]),               # shape -> (C, D, H, W)
-    Orientationd(keys=["image", "label"], axcodes="RAS"),      # consistent orientation
-    Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear","nearest")),
-    ScaleIntensityd(keys=["image"]),                           # robust intensity scaling
-    NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
-    # sample positive/negative patches of fixed size -> ensures consistent shapes
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    ScaleIntensityRanged(keys=["image"], a_min=-200, a_max=200, b_min=0.0, b_max=1.0, clip=True),
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
@@ -76,9 +76,11 @@ train_transforms = Compose([
         image_threshold=0.0,
         allow_smaller= True
     ),
-    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-    RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(1, 2)),
-    RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.01),
+    Resized(keys=["image", "label"], spatial_size=roi_size, mode=("trilinear", "nearest")),
+
+   # RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+   # RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(1, 2)),
+   # RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.01),
     EnsureTyped(keys=["image", "label"]),
 ])
 
