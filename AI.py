@@ -1,7 +1,9 @@
 #Install & imports
 !pip install -q "monai[all]" nibabel
 
-import os, json, math
+import os
+import json
+import math
 from glob import glob
 import matplotlib.pyplot as plt
 import torch
