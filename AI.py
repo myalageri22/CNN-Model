@@ -343,38 +343,3 @@ plt.subplot(1,3,3); plt.plot(lrs);          plt.title("LR");        plt.xlabel("
 plt.tight_layout(); plt.show()
 
 print(f"Best Val Dice = {best_dice:.4f}")
-
-
-
-
-
-"""
-
-            # save model if improved
-            if val_metric > best_val:
-                best_val = val_metric
-                torch.save(model.state_dict(), model_path)
-                print("Saved best model.")
-
-#Plot training curves
-plt.figure(figsize=(10,4))
-plt.subplot(1,2,1)
-plt.plot(train_losses, label="Train Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.legend()
-
-plt.subplot(1,2,2)
-plt.plot(val_dice_scores, label="Val Dice")
-plt.xlabel("Epoch")
-plt.ylabel("Dice")
-plt.legend()
-plt.show()
-
-#Load best model (optional)
-if os.path.exists(model_path):
-    model.load_state_dict(torch.load(model_path))
-    print("Loaded best model.")
-else:
-  print("error")
-"""
