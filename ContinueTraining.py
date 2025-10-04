@@ -24,9 +24,6 @@ from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
 from monai.data.utils import pad_list_data_collate
 
-#!pip install -q "monai[all]" nibabel
-
-import monai
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
     ScaleIntensityRanged, NormalizeIntensityd,
