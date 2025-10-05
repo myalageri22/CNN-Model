@@ -3,20 +3,18 @@
 import os, json, math
 import numpy as np
 import torch
+import torch.nn.functional as F
 from glob import glob
 import matplotlib.pyplot as plt
 !pip install -q --upgrade "torch==2.3.1+cu121" "torchvision==0.18.1+cu121" -f https://download.pytorch.org/whl/torch_stable.html
 !pip install -q "monai[all]" nibabel
-import torch, monai
+import monai
 print(torch.__version__, monai.__version__)
-
 
 
 from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import train_test_split
-
-import monai
 
 from monai.data import PersistentDataset, DataLoader, decollate_batch
 from monai.networks.nets import UNet
@@ -43,8 +41,8 @@ from sklearn.model_selection import train_test_split
 DATADIR = "/content/drive/MyDrive/orig"
 WORKDIR = "/content/drive/MyDrive/CNNProjectWorkFlow"
 SPLIT_JSON = os.path.join(WORKDIR, "split.json")
-CKPT_BEST  = os.path.join(WORKDIR, "unet3d_best.ckpt")
-CKPT_LAST  = os.path.join(WORKDIR, "unet3d_last.ckpt")
+CKPT_BEST = os.path.join(WORKDIR, "unet3d_best.ckpt")
+CKPT_LAST = os.path.join(WORKDIR, "unet3d_last.ckpt")
 
 # NEW cache dir for fine-tuning (so updated transforms don’t conflict with old cache)
 CACHE_DIR_FT = os.path.join(WORKDIR, "cache_ft")
@@ -52,12 +50,24 @@ os.makedirs(CACHE_DIR_FT, exist_ok=True)
 
 # --- load the saved split (don’t reshuffle) ---
 #with open(SPLIT_JSON, "r") as f:
-    #splits = json.load(f)
+#splits = json.load(f)
 #train_files, val_files = splits["train"], splits["val"]
 #print(f"[FT] Train cases: {len(train_files)} | Val cases: {len(val_files)}")
 # --- sanity check the paths
 print("DATADIR:", DATADIR, "exists?", os.path.isdir(DATADIR))
 print("WORKDIR:", WORKDIR, "exists?", os.path.isdir(WORKDIR))
+
+# ------------- HELPER --------------
+def remove_small_objects_mask(mask, min_size=64):
+    # mask: numpy array 0/1
+    lab, n = ndi.label(mask)
+    sizes = ndi.sum(mask, lab, range(1, n+1))
+    out = np.zeros_like(mask)
+    for i, s in enumerate(sizes, start=1):
+        if s >= min_size:
+            out[lab == i] = 1
+    return out
+
 
 # show what’s inside WORKDIR (helps catch /WorkFlow vs /Workflow mistakes)
 if os.path.isdir(WORKDIR):
@@ -103,14 +113,30 @@ print(f"[FT] Train cases: {len(train_files)} | Val cases: {len(val_files)}")
 
 
 # Hyperparameters for fine-tuning
-device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-pixdim      = (1.2, 1.2, 1.2)
-roi_size    = (64, 192, 160)          # divisible by 16
-batch_size  = 2
-val_bs      = 1
-max_epochs  = 50                       # fine-tune for 50 more
-val_every   = 1
-best_dice   = -1.0
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pixdim = (1.2, 1.2, 1.2)
+roi_size = (64, 192, 160)          # divisible by 16
+batch_size = 2
+val_bs = 1
+max_epochs = 50                       # fine-tune for 50 more
+val_every = 1
+best_dice = -1.0
+
+pos_weight = None
+try:
+    import nibabel as nib
+    pos_vox, neg_vox = 0, 0
+    for item in train_files:
+        lab = nib.load(item["label"]).get_fdata()
+        pos_vox += (lab > 0.5).sum()
+        neg_vox += (lab <= 0.5).sum()
+    pos_weight_val = float(max(1.0, neg_vox / (pos_vox + 1e-9)))
+    pos_weight_val = min(pos_weight_val, 200.0)
+    pos_weight = torch.tensor([pos_weight_val], device=device)
+    print(f"[pos_weight] pos_vox={int(pos_vox)} neg_vox={int(neg_vox)} pos_weight={pos_weight_val:.3f}")
+except Exception as e:
+    pos_weight = None
+    print("[pos_weight] Could not compute pos_weight; continuing without it. Error:", e)
 
 # Increase positive sampling & number of patches (helps sparse vessels)
 pos_patches = 4
@@ -118,8 +144,8 @@ neg_patches = 1
 num_samples = 6
 
 # Toggle extra augmentations after model is already learning
-USE_ELASTIC   = True
-USE_CONTRAST  = True
+USE_ELASTIC = True
+USE_CONTRAST = True
 
 from monai.transforms import Rand3DElasticd, RandAdjustContrastd
 
@@ -205,15 +231,15 @@ from monai.data import CacheDataset
 train_ds_ft = CacheDataset(
     data=train_files, transform=train_transforms_ft, cache_rate=1.0  # cache everything in RAM
 )
-val_ds_ft   = CacheDataset(
-    data=val_files,   transform=val_transforms_ft,   cache_rate=1.0
+val_ds_ft = CacheDataset(
+    data=val_files, transform=val_transforms_ft, cache_rate=1.0
 )
 
 train_loader = DataLoader(
     train_ds_ft, batch_size=batch_size, shuffle=True, num_workers=2,
     collate_fn=pad_list_data_collate, pin_memory=torch.cuda.is_available()
 )
-val_loader   = DataLoader(
+val_loader = DataLoader(
     val_ds_ft, batch_size=val_bs, shuffle=False, num_workers=1,
     collate_fn=pad_list_data_collate, pin_memory=torch.cuda.is_available()
 )
@@ -234,9 +260,12 @@ model = UNet(
 
 # Switch to Tversky to emphasize recall (thin vessels); keep a BCE component for stability
 loss_tversky = TverskyLoss(alpha=0.3, beta=0.7, sigmoid=True)  # beta>alpha => penalize FN more
-bce_logits   = torch.nn.BCEWithLogitsLoss()
+if pos_weight is not None:
+    bce_logits = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+else:
+    bce_logits = torch.nn.BCEWithLogitsLoss()
 
-def seg_loss(logits, target):
+ seg_loss(logits, target):
     return 0.7 * loss_tversky(logits, target) + 0.3 * bce_logits(logits, target)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)  # lower LR for fine-tuning
