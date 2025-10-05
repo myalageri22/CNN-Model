@@ -96,28 +96,29 @@ if not os.path.exists(SPLIT_JSON):
 
 if not os.path.exists(SPLIT_JSON):
     # No split found anywhere → build from DATADIR now
+    from glob import glob
+    import os, re
+
+    all_files = glob(os.path.join(DATADIR, "*.nii.gz"))
+
     images = sorted([f for f in all_files if f.endswith("_orig.nii.gz")])
     labels = sorted([f for f in all_files if f.endswith("_orig_seg.nii.gz")])
     endpoints = sorted([f for f in all_files if f.endswith("_orig_seg_endpoints.nii.gz")])
-    
+
     img_nums = [int(re.search(r'pat(\d+)_orig.nii.gz', os.path.basename(f)).group(1)) for f in images]
     label_nums = [int(re.search(r'pat(\d+)_orig_seg.nii.gz', os.path.basename(f)).group(1)) for f in labels]
     end_nums = [int(re.search(r'pat(\d+)_orig_seg_endpoints.nii.gz', os.path.basename(f)).group(1)) for f in endpoints]
-    
-    assert img_nums == label_nums == end_nums, "Patient numbers do not match between image, label, and endpoints"
-    
+
+    assert img_nums == label_nums == end_nums, \
+        "Patient numbers do not match between image, label, and endpoints"
+
     data = [{"image": i, "label": l, "endpoints": e} for i, l, e in zip(images, labels, endpoints)]
+    print(f"Discovered {len(data)} triplets in {DATADIR}")
 
-    with open(SPLIT_JSON, "w") as f:
-        json.dump({"train": train_files, "val": val_files}, f, indent=2)
-    print("Created split.json at:", SPLIT_JSON)
-else:
-    print("Loading split from:", SPLIT_JSON)
-    with open(SPLIT_JSON, "r") as f:
-        splits = json.load(f)
-    train_files, val_files = splits["train"], splits["val"]
+    # Train/val split
+    from sklearn.model_selection import train_test_split
+    train_files, val_files = train_test_split(data, test_size=0.2, random_state=42)
 
-print(f"[FT] Train cases: {len(train_files)} | Val cases: {len(val_files)}")
 
 
 # Hyperparameters for fine-tuning
