@@ -14,6 +14,9 @@ print(torch.__version__, monai.__version__)
 
 from torch.cuda.amp import autocast, GradScaler
 
+from monai.inferers import sliding_window_inference
+from tqdm import tqdm
+
 from sklearn.model_selection import train_test_split
 
 from monai.data import PersistentDataset, DataLoader, decollate_batch
@@ -239,6 +242,22 @@ train_loader = DataLoader(
     train_ds_ft, batch_size=batch_size, shuffle=True, num_workers=2,
     collate_fn=pad_list_data_collate, pin_memory=torch.cuda.is_available()
 )
+
+if USE_ONECYCLE:
+    steps_per_epoch = len(train_loader)
+    max_lr = 5e-5
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        total_steps=steps_per_epoch * max_epochs,
+        anneal_strategy="cos",
+        pct_start=0.1
+    )
+else:
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", patience=5, factor=0.5, verbose=True
+    )
+
 val_loader = DataLoader(
     val_ds_ft, batch_size=val_bs, shuffle=False, num_workers=1,
     collate_fn=pad_list_data_collate, pin_memory=torch.cuda.is_available()
@@ -269,7 +288,15 @@ else:
     return 0.7 * loss_tversky(logits, target) + 0.3 * bce_logits(logits, target)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)  # lower LR for fine-tuning
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=5, factor=0.5, verbose=True)
+scaler = GradScaler()
+torch.backends.cudnn.benchmark = True
+
+accum_steps = 1 # increase to 2-4 for effective larger batch
+clip_grad_norm = 1.0  # gradient clipping
+
+
+scheduler = None
+USE_ONECYCLE = True
 
 dice_metric = DiceMetric(include_background=False, reduction="mean")
 post_pred   = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
@@ -289,52 +316,87 @@ train_losses, val_dices, lrs = [], [], []
 for epoch in range(start_epoch, start_epoch + max_epochs):
     model.train()
     running, steps = 0.0, 0
-    for batch in train_loader:
+    optimizer.zero_grad(set_to_none=True)
+
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} train", leave=False)
+    for i, batch in enumerate(pbar):
         x = batch["image"].to(device)
         y = batch["label"].to(device).float()
 
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = seg_loss(logits, y)
-        loss.backward()
-        optimizer.step()
+        with autocast():
+            logits = model(x)
+            loss = seg_loss(logits, y) / accum_steps
 
-        running += loss.item(); steps += 1
+        scaler.scale(loss).backward()
+        running += loss.item() * accum_steps
+        steps += 1
+
+        if (i + 1) % accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+            if USE_ONECYCLE:
+                scheduler.step()  # step per optimizer update
+
+        pbar.set_postfix({"loss": f"{running/max(1,steps):.4f}", 
+                          "lr": optimizer.param_groups[0]["lr"]})
 
     avg_loss = running / max(1, steps)
     train_losses.append(avg_loss)
     lrs.append(optimizer.param_groups[0]["lr"])
     print(f"Epoch {epoch} | train loss: {avg_loss:.4f} | lr: {lrs[-1]:.2e}")
 
-    # --- Validation ---
+    # ----------------- VALIDATION -----------------
     model.eval(); dice_metric.reset()
     with torch.no_grad():
-        for vb in val_loader:
+        for vb in tqdm(val_loader, desc=f"Epoch {epoch} val", leave=False):
             vx = vb["image"].to(device)
             vy = vb["label"].to(device).float()
-            vlogits = model(vx)
-            pr_list = [post_pred(p)  for p in decollate_batch(vlogits)]
+
+            # Sliding window inference
+            vlogits = sliding_window_inference(
+                inputs=vx,
+                roi_size=roi_size,
+                sw_batch_size=1,
+                predictor=model,
+                overlap=0.5
+            )
+
+            pr_list = [post_pred(p) for p in decollate_batch(vlogits)]
             gt_list = [post_label(g) for g in decollate_batch(vy)]
+            
+            # Optional: remove small connected components
+            # pr_list = [remove_small_objects_mask(p.cpu().numpy(), min_size=64) for p in pr_list]
+
             dice_metric(y_pred=pr_list, y=gt_list)
+
         val_dice = dice_metric.aggregate().item()
         dice_metric.reset()
         val_dices.append(val_dice)
         print(f"  val dice: {val_dice:.4f}")
+
+    if not USE_ONECYCLE:
         scheduler.step(val_dice)
 
     # Save LAST every epoch
     torch.save(
         {"epoch": epoch, "model": model.state_dict(),
-         "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+         "optimizer": optimizer.state_dict(), 
+         "scheduler": scheduler.state_dict() if scheduler is not None else None,
          "best_dice": best_dice},
         CKPT_LAST,
     )
+
     # Save BEST on improvement
     if val_dice > best_dice:
         best_dice = val_dice
         torch.save(
             {"epoch": epoch, "model": model.state_dict(),
-             "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+             "optimizer": optimizer.state_dict(), 
+             "scheduler": scheduler.state_dict() if scheduler is not None else None,
              "best_dice": best_dice},
             CKPT_BEST,
         )
