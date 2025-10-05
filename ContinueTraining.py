@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 !pip install -q "monai[all]" nibabel
 import monai
 print(torch.__version__, monai.__version__)
+import re
 
 
 from torch.cuda.amp import autocast, GradScaler
@@ -95,14 +96,17 @@ if not os.path.exists(SPLIT_JSON):
 
 if not os.path.exists(SPLIT_JSON):
     # No split found anywhere → build from DATADIR now
-    images = sorted(glob(os.path.join(DATADIR, "*orig.nii.gz")))
-    labels = sorted(glob(os.path.join(DATADIR, "*orig_seg.nii.gz")))
-    print(f"Discovered: {len(images)} images, {len(labels)} labels in {DATADIR}")
-    assert len(images) == len(labels) and len(images) > 0, \
-        "No matching image/label pairs found in DATADIR. Check patterns and DATADIR path."
-
-    data = [{"image": i, "label": l} for i, l in zip(images, labels)]
-    train_files, val_files = train_test_split(data, test_size=0.2, random_state=42)
+    images = sorted([f for f in all_files if f.endswith("_orig.nii.gz")])
+    labels = sorted([f for f in all_files if f.endswith("_orig_seg.nii.gz")])
+    endpoints = sorted([f for f in all_files if f.endswith("_orig_seg_endpoints.nii.gz")])
+    
+    img_nums = [int(re.search(r'pat(\d+)_orig.nii.gz', os.path.basename(f)).group(1)) for f in images]
+    label_nums = [int(re.search(r'pat(\d+)_orig_seg.nii.gz', os.path.basename(f)).group(1)) for f in labels]
+    end_nums = [int(re.search(r'pat(\d+)_orig_seg_endpoints.nii.gz', os.path.basename(f)).group(1)) for f in endpoints]
+    
+    assert img_nums == label_nums == end_nums, "Patient numbers do not match between image, label, and endpoints"
+    
+    data = [{"image": i, "label": l, "endpoints": e} for i, l, e in zip(images, labels, endpoints)]
 
     with open(SPLIT_JSON, "w") as f:
         json.dump({"train": train_files, "val": val_files}, f, indent=2)
