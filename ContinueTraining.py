@@ -2,6 +2,7 @@
 
 import os, json, math
 import numpy as np
+import scipy.ndimage as ndi
 import torch
 import torch.nn.functional as F
 from glob import glob
@@ -243,21 +244,6 @@ train_loader = DataLoader(
     collate_fn=pad_list_data_collate, pin_memory=torch.cuda.is_available()
 )
 
-if USE_ONECYCLE:
-    steps_per_epoch = len(train_loader)
-    max_lr = 5e-5
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=max_lr,
-        total_steps=steps_per_epoch * max_epochs,
-        anneal_strategy="cos",
-        pct_start=0.1
-    )
-else:
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", patience=5, factor=0.5, verbose=True
-    )
-
 val_loader = DataLoader(
     val_ds_ft, batch_size=val_bs, shuffle=False, num_workers=1,
     collate_fn=pad_list_data_collate, pin_memory=torch.cuda.is_available()
@@ -284,7 +270,7 @@ if pos_weight is not None:
 else:
     bce_logits = torch.nn.BCEWithLogitsLoss()
 
- seg_loss(logits, target):
+def seg_loss(logits, target):
     return 0.7 * loss_tversky(logits, target) + 0.3 * bce_logits(logits, target)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)  # lower LR for fine-tuning
@@ -313,6 +299,20 @@ print(f"[FT] Resumed from BEST: epoch={start_epoch}, best_dice={best_dice:.4f}")
 # Fine-tuning loop
 train_losses, val_dices, lrs = [], [], []
 
+if USE_ONECYCLE:
+    steps_per_epoch = len(train_loader)
+    max_lr = 5e-5
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        total_steps=steps_per_epoch * max_epochs,
+        anneal_strategy="cos",
+        pct_start=0.1
+    )
+else:
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", patience=5, factor=0.5, verbose=True
+    )
 for epoch in range(start_epoch, start_epoch + max_epochs):
     model.train()
     running, steps = 0.0, 0
