@@ -18,7 +18,7 @@ highlighting the vascular structures into a highly detailed map of vessel and no
 Model Training:
 
 Supervised learning will be the method employed with 70% of the dataset for training, 15% for testing, and 15% validation. 
-Due to the large size of 3D MRI scans, batch sizes will range from 1–4. 
+Due to the large size of 3D MRI scans, batch sizes will range from 1-4. 
 The network will be trained for approximately 100 epochs using the Adam optimizer. For model evaluation, the Dice coefficient 
 will be used to measure the accuracy between the prediction of the AI and the ground truth, and Hausdorff distance to measure 
 the distance between the predicted and the actual vessel boundaries. 
