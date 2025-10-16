@@ -1,8 +1,0 @@
-import torch
-
-loaded_data = torch.load("file.pt")
-model = YourModelClass()
-model.load_state_dict(loaded_data)
-model.eval()
-print(loaded_data)
-print(loaded_data.shape
