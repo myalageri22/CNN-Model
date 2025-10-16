@@ -24,7 +24,14 @@ except ModuleNotFoundError as exc:
         "Install it with `pip install torch` (pick the wheel matching your Python version and platform)."
     ) from exc
 
-from torch.cuda.amp import GradScaler
+try:
+    from torch.cuda.amp import GradScaler, autocast
+    _AMP_AVAILABLE = True
+except Exception:
+    GradScaler = None
+    autocast = None
+    _AMP_AVAILABLE = False
+
 import torch.nn as nn
 
 try:
@@ -45,7 +52,13 @@ class Config:
         self.checkpoint_dir = self.project_root / "checkpoints"
         self.log_dir = self.project_root / "logs"
         self.processed_dir = self.data_dir / "processed"
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
 
         # data / transform
         self.pixdim = (1.0, 1.0, 1.0)
@@ -149,17 +162,18 @@ class LocalDataManager:
             raise FileNotFoundError(f"Dataset not found: {zip_path}")
 
     def _flatten_directory(self, path: Path):
-        # move any .nii/.nii.gz up to top-level processed dir for simplicity
+        # move any .nii or .nii.gz up to top-level processed dir for simplicity
         for p in path.rglob("*"):
-            if p.is_file() and p.suffix in [".nii", ".gz"] and ("nii" in p.name):
+            if p.is_file() and p.name.lower().endswith((".nii", ".nii.gz")):
                 target = path / p.name
                 if p.resolve() != target.resolve():
                     shutil.move(str(p), str(target))
 
     def find_nifti_files(self, root_dir: Path) -> List[Path]:
         root = Path(root_dir)
-        files = [p for p in root.rglob("*") if p.is_file() and (p.suffix in [".nii", ".gz"] and "nii" in p.name)]
+        files = [p for p in root.rglob("*") if p.is_file() and p.name.lower().endswith((".nii", ".nii.gz"))]
         return files
+
 
 
 class DatasetPairer:
@@ -414,15 +428,53 @@ def build_loss_function(pos_weight, logger: logging.Logger):
 
 
 class Trainer:
-    def __init__(self, config: Config, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.use_amp = config.device.startswith("cuda")
-        self.scaler = GradScaler(enabled=self.use_amp)
-        self.ckpt_best = None
-        self.ckpt_last = None
-        self.metrics_file = self.config.project_root / "training_metrics.json"
-        self.best_loss = float("inf")
+    def __init__(self):
+        # basic runtime
+        self.project_root = Path(__file__).resolve().parent
+        self.data_dir = self.project_root / "data"
+        self.checkpoint_dir = self.project_root / "checkpoints"
+        self.log_dir = self.project_root / "logs"
+        self.processed_dir = self.data_dir / "processed"
+
+        # detect device: prefer CUDA, then MPS (Apple silicon), otherwise CPU
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+
+        # data / transform
+        self.pixdim = (1.0, 1.0, 1.0)
+        self.roi_size = (64, 192, 160)
+
+        # training defaults
+        self.batch_size = 2
+        self.learning_rate = 1e-4
+        self.weight_decay = 1e-5
+        cpu_count = os.cpu_count() or 1
+
+        # Platform-sensitive num_workers (safer defaults for macOS/Windows)
+        if sys.platform == "darwin":
+            self.num_workers = min(2, cpu_count)
+        elif sys.platform.startswith("win"):
+            self.num_workers = min(2, cpu_count)
+        else:
+            self.num_workers = min(4, cpu_count)
+
+        # pin_memory only useful when using CUDA
+        self.pin_memory = (self.device == "cuda")
+
+        self.accumulation_steps = 1
+        self.use_attention = False
+
+        # files
+        self.split_file = self.project_root / "splits.json"
+
+        # ensure dirs
+        for d in (self.data_dir, self.checkpoint_dir, self.log_dir, self.processed_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
 
     def mixup_3d(self, x1, y1, x2, y2, alpha=0.2):
         lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
@@ -438,19 +490,33 @@ class Trainer:
             images = batch["image"].to(self.config.device)
             labels = batch["label"].to(self.config.device)
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+
+            # AMP path only when using CUDA and AMP is available
+            if self.use_amp:
+                # autocast comes from torch.cuda.amp
+                with autocast():
+                    logits = model(images)
+                    loss = loss_fn(logits, labels)
+                # scale, backward, step using scaler
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                # FP32 fallback (works on CPU and MPS)
                 logits = model(images)
                 loss = loss_fn(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                loss.backward()
+                optimizer.step()
+
             if scheduler is not None:
                 scheduler.step()
+
             running_loss += float(loss.item())
             n += 1
         avg = running_loss / max(1, n)
         self.logger.info(f"Epoch {epoch} train loss: {avg:.4f}")
         return avg
+
 
     def validate_epoch(self, model, loader, metrics, epoch):
         model.eval()
@@ -759,6 +825,15 @@ if __name__ == "__main__":
         description="Vascular Segmentation Training Pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+    # Ensure safe multiprocessing start method on platforms that require 'spawn'
+    try:
+        import multiprocessing as mp
+        if sys.platform == "darwin" or sys.platform.startswith("win"):
+            mp.set_start_method("spawn", force=True)
+    except Exception:
+        # if start method already set or unavailable, ignore
+        pass
+
 
     parser.add_argument(
         "--data_dir",
@@ -814,6 +889,12 @@ if __name__ == "__main__":
         type=int,
         default=42,
         help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--roi_size",
+        type=str,
+        default="64,192,160",
+        help="ROI size for training (format: H,W,D)"
     )
 
     args = parser.parse_args()
